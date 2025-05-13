@@ -1,34 +1,31 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
-#include <esp_wifi.h>  // For WiFi power control
-#include <esp_bt.h>    // For basic Bluetooth power control
-#include <esp_sleep.h> // For sleep modes
+#include <esp_wifi.h>
+#include <esp_sleep.h>
 
 // Pin and PWM configuration
 const int NUM_LEDS = 3;
 const int LED_PINS[NUM_LEDS] = {25, 26, 27};  // GPIO pins for the LEDs
 const int PWM_CHANNELS[NUM_LEDS] = {0, 1, 2}; // Separate PWM channel for each LED
 const int PWM_RESOLUTION = 12;                // 12-bit resolution (0-4095)
-const int PWM_FREQUENCY = 1000;               // 5kHz frequency
+const int PWM_FREQUENCY = 500;                // Lower frequency to save power
 
-// Timing configurations (in milliseconds)
-const unsigned long FADE_IN_DURATION = 2000;   // Fade in over 2 seconds
-const unsigned long FULL_BRIGHTNESS_DURATION = 800; // Hold full brightness for 800ms
-const unsigned long FADE_OUT_DURATION = 1500;  // Fade out over 1.5 seconds
-const unsigned long OFF_DURATION = 600;        // Hold off state for 600ms
+// Sleep & Wake configuration - EXTREME OPTIMIZATION
+const unsigned long LISTEN_DURATION = 10000;  // Listen for 10 seconds
+const unsigned long SLEEP_DURATION = 1000;    // Sleep for only 1 second
+const unsigned long INITIAL_LISTEN = 60000;   // Listen for 60 seconds on first boot
 
-// Test speed
-const int TEST_SPEED_DEFAULT = 250;  // Default speed in milliseconds
-int testSpeed = TEST_SPEED_DEFAULT;  // Adjustable speed that can be changed
+// WiFi channel - MUST MATCH SENDER
+const uint8_t WIFI_CHANNEL = 1;               // Fixed channel for better communication
 
-// LED states
-enum LedState {
-  FADE_IN,
-  FULL_BRIGHTNESS,
-  FADE_OUT,
-  OFF
-};
+// Skip sleep cycles to stay awake longer
+const int INITIAL_NO_SLEEP_CYCLES = 3;        // Stay awake for multiple cycles initially
+int noSleepCyclesLeft = INITIAL_NO_SLEEP_CYCLES;
+
+// Current LED state
+int currentLedIndex = -1;
+int bootCount = 0;
 
 // ESP-NOW Data Structure
 typedef struct {
@@ -37,178 +34,26 @@ typedef struct {
   bool useString;   // Flag to indicate if we're using string or int
 } ESPNOWData;
 
-// Global variables
-LedState ledStates[NUM_LEDS] = {OFF, OFF, OFF}; // All LEDs start off
-unsigned long stateStartTimes[NUM_LEDS] = {0, 0, 0};
-unsigned long lastUpdateTime = 0;
-const unsigned long UPDATE_INTERVAL = 10; // Update PWM every 10ms (was 5ms)
-int activeLed = -1; // Tracks which LED is currently active
-unsigned long lastActivityTime = 0; // Track last activity for power management
+// Debugging - set to true for testing
+const bool SERIAL_ENABLED = true;
 
-// Power management settings
-const uint8_t WIFI_TX_POWER = 8;     // Lowest usable power level (8 = ~2dBm)
-const bool SERIAL_ENABLED = false;    // Set to false to disable Serial after init
-const int MIN_CPU_FREQ = 80;         // Minimum CPU frequency (was 40, but 80 is safer)
-const int NORMAL_CPU_FREQ = 80;     // Normal running CPU frequency
+// Variables 
+unsigned long listenStartTime = 0;
+bool messageReceived = false;
 
-// Most recent received data
-ESPNOWData receivedData;
-bool newDataReceived = false;
-
-// Custom print function that checks if Serial should be used
+// Function to print debug messages
 void debugPrint(const String &message) {
   if (SERIAL_ENABLED) {
     Serial.println(message);
-  }
-}
-
-// Function prototypes
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len);
-void setLedBrightness(int ledIndex, float brightness);
-float calculateFadeInBrightness(float progress);
-float calculateFadeOutBrightness(float progress);
-void updateLedState(int ledIndex, unsigned long currentTime);
-void runLedTest();
-void setTestSpeed(int speedValue);
-void randomLedBlink(int count, int speed);
-void processReceivedData();
-
-// ESP-NOW callback function to handle received data
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-  // Update activity time first thing
-  lastActivityTime = millis();
-  
-  // We need to temporarily boost CPU frequency for processing
-  setCpuFrequencyMhz(NORMAL_CPU_FREQ);
-  
-  if (SERIAL_ENABLED) {
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    
-    Serial.print("ESP-NOW from: ");
-    Serial.print(macStr);
-    Serial.print(", len: ");
-    Serial.println(len);
-  }
-  
-  if (len == sizeof(ESPNOWData)) {
-    memcpy(&receivedData, incomingData, sizeof(ESPNOWData));
-    newDataReceived = true;
-    
-    if (SERIAL_ENABLED) {
-      Serial.print("Data: ");
-      if (receivedData.useString) {
-        Serial.print("String: ");
-        Serial.println(receivedData.message);
-      } else {
-        Serial.print("LED #");
-        Serial.println(receivedData.ledNumber);
-      }
-    }
-    
-    // Process immediately
-    processReceivedData();
-  }
-}
-
-
-// Safe power-saving implementation
-void applyPowerSaving() {
-  debugPrint("Applying power saving measures...");
-  
-  // 1. Disable Bluetooth (safe method)
-  btStop();  // This safely disables BT on ESP32
-  
-  // 2. Set WiFi to minimum power mode
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-  esp_wifi_set_max_tx_power(WIFI_TX_POWER);
-  
-  // 3. Reduce CPU frequency
-  setCpuFrequencyMhz(MIN_CPU_FREQ);
-  
-  // 4. Configure unused GPIO pins to reduce power leakage
-  for (int i = 0; i < 40; i++) {
-    // Skip LED pins (25, 26, 27) and essential system pins
-    if (i != 25 && i != 26 && i != 27 && i != 0 && i != 1 && i != 3) {
-      pinMode(i, INPUT_PULLDOWN);
-    }
-  }
-  
-  // 5. Configure light sleep for delay()
-  esp_sleep_enable_timer_wakeup(1000); // Wake every 1ms
-  
-  // 6. Disable WiFi auto-reconnect (saves power on connection loss)
-  WiFi.setAutoReconnect(false);
-  
-  // Print current status
-  debugPrint("Power saving mode active:");
-  debugPrint("- Bluetooth: Disabled");
-  debugPrint("- WiFi TX Power: Minimum");
-  debugPrint("- CPU Frequency: " + String(getCpuFrequencyMhz()) + " MHz");
-  debugPrint("- Light sleep: Enabled for delay()");
-  
-  // Optional: Disable Serial after setup if configured
-  if (!SERIAL_ENABLED) {
-    Serial.println("Serial will be disabled in 3 seconds to save power...");
-    Serial.println("ESP-NOW reception will continue to work");
-    delay(3000);
-    Serial.end();
-  }
-}
-
-
-
-// Process received ESP-NOW data
-void processReceivedData() {
-  if (!newDataReceived) return;
-  
-  newDataReceived = false;
-  int targetLed = -1;
-  
-  // Determine which LED to activate based on received data
-  if (receivedData.useString) {
-    String message = String(receivedData.message);
-    message.toLowerCase();
-    
-    if (message == "green") {
-      targetLed = 0; // LED on pin 25
-    } else if (message == "yellow") {
-      targetLed = 1; // LED on pin 26
-    } else if (message == "red") {
-      targetLed = 2; // LED on pin 27
-    }
-  } else {
-    // Using numerical value (0, 1, or 2)
-    if (receivedData.ledNumber >= 0 && receivedData.ledNumber < NUM_LEDS) {
-      targetLed = receivedData.ledNumber;
-    }
-  }
-  
-  // If valid LED target was determined, activate it
-  if (targetLed >= 0) {
-    // Turn off all LEDs first
-    for (int i = 0; i < NUM_LEDS; i++) {
-      if (i != targetLed) {
-        ledStates[i] = OFF;
-        setLedBrightness(i, 0);
-      }
-    }
-    
-    // Start the fade in sequence for the target LED
-    unsigned long currentTime = millis();
-    ledStates[targetLed] = FADE_IN;
-    stateStartTimes[targetLed] = currentTime;
-    activeLed = targetLed; // Track which LED is active
-    
-    Serial.print("Activating LED ");
-    Serial.print(LED_PINS[targetLed]);
-    Serial.println(" based on received data - continuous mode");
+    Serial.flush(); // Make sure message is sent completely
   }
 }
 
 // Set LED brightness (0.0 = off, 1.0 = full brightness)
 void setLedBrightness(int ledIndex, float brightness) {
+  // Only process valid indices
+  if (ledIndex < 0 || ledIndex >= NUM_LEDS) return;
+  
   // Clamp brightness between 0 and 1
   brightness = (brightness < 0) ? 0 : (brightness > 1) ? 1 : brightness;
   
@@ -217,229 +62,305 @@ void setLedBrightness(int ledIndex, float brightness) {
   ledcWrite(PWM_CHANNELS[ledIndex], dutyCycle);
 }
 
-// Calculate brightness during fade-in (cubic curve for ultra-soft start)
-float calculateFadeInBrightness(float progress) {
-  // Cubic curve makes the initial part of the transition much more gradual
-  return progress * progress * progress;
-}
-
-// Calculate brightness during fade-out (quadratic curve)
-float calculateFadeOutBrightness(float progress) {
-  // Invert progress for fade-out (1.0 → 0.0)
-  float invProgress = 1.0 - progress;
-  // Quadratic curve for smooth fade-out
-  return invProgress * invProgress;
-}
-
-// Function to make the test speed adjustable
-void setTestSpeed(int speedValue) {
-  // speedValue is in milliseconds, smaller = faster
-  // Constrain between 50ms (very fast) and 500ms (very slow)
-  testSpeed = constrain(speedValue, 50, 500);
-  Serial.print("LED test speed set to: ");
-  Serial.println(testSpeed);
-}
-
-// Random LED blink for testing
-void randomLedBlink(int count, int speed) {
-  Serial.println("Random LED blinking at double speed...");
-  
-  // Turn off all LEDs initially
+// Turn off all LEDs except the specified one
+void setActiveLed(int ledIndex) {
   for (int i = 0; i < NUM_LEDS; i++) {
-    setLedBrightness(i, 0);
+    if (i == ledIndex) {
+      setLedBrightness(i, 1.0); // Full brightness
+    } else {
+      setLedBrightness(i, 0.0); // Off
+    }
   }
   
-  // Perform random blinks
-  for (int i = 0; i < count; i++) {
-    // Select a random LED
-    int ledIndex = random(NUM_LEDS);
-    
-    // Turn it on
-    setLedBrightness(ledIndex, 1.0);
-    delay(speed);
-    
-    // Turn it off
-    setLedBrightness(ledIndex, 0.0);
-    delay(speed / 2);  // Shorter off time for more dynamic effect
-  }
-  
-  Serial.println("Random blinking complete.");
-}
-
-// Update state for a specific LED
-void updateLedState(int ledIndex, unsigned long currentTime) {
-  // If LED is in OFF state, just keep it off
-  if (ledStates[ledIndex] == OFF) {
-    setLedBrightness(ledIndex, 0);
-    return;
-  }
-
-  // Normal state machine for active LEDs
-  unsigned long elapsedTime = currentTime - stateStartTimes[ledIndex];
-  float progress;
-  
-  switch (ledStates[ledIndex]) {
-    case FADE_IN:
-      if (elapsedTime < FADE_IN_DURATION) {
-        progress = (float)elapsedTime / FADE_IN_DURATION;
-        setLedBrightness(ledIndex, calculateFadeInBrightness(progress));
-      } else {
-        ledStates[ledIndex] = FULL_BRIGHTNESS;
-        stateStartTimes[ledIndex] = currentTime;
-        setLedBrightness(ledIndex, 1.0); // Full brightness
-      }
-      break;
-      
-    case FULL_BRIGHTNESS:
-      if (elapsedTime >= FULL_BRIGHTNESS_DURATION) {
-        ledStates[ledIndex] = FADE_OUT;
-        stateStartTimes[ledIndex] = currentTime;
-      }
-      break;
-      
-    case FADE_OUT:
-      if (elapsedTime < FADE_OUT_DURATION) {
-        progress = (float)elapsedTime / FADE_OUT_DURATION;
-        setLedBrightness(ledIndex, calculateFadeOutBrightness(progress));
-      } else {
-        // Instead of going to OFF state, start the FADE_IN again to create a continuous cycle
-        ledStates[ledIndex] = FADE_IN;
-        stateStartTimes[ledIndex] = currentTime;
-      }
-      break;
-  }
+  // Remember this LED
+  currentLedIndex = ledIndex;
+  debugPrint("Active LED set to index " + String(ledIndex));
 }
 
 // Test all LEDs in sequence
 void runLedTest() {
-  // First turn everything off
-  for (int i = 0; i < NUM_LEDS; i++) {
-    setLedBrightness(i, 0);
-  }
-  delay(300);
+  debugPrint("=== STARTING LED TEST ===");
   
-  Serial.println("=== STARTING LED TEST ===");
-  Serial.println("Running building-up-and-down pattern followed by random blinks");
-  
-  // ======== BUILDING UP PATTERN ========
-  Serial.println("Building UP: 25→25+26→25+26+27");
-  
-  // Start with all LEDs off
+  // Turn off all LEDs initially
   for (int i = 0; i < NUM_LEDS; i++) {
     setLedBrightness(i, 0.0);
   }
+  delay(300);
   
-  // Building up (progressively add LEDs)
+  // Sequence through each LED
   for (int i = 0; i < NUM_LEDS; i++) {
-    Serial.print("Adding LED GPIO ");
-    Serial.println(LED_PINS[i]);
-    
-    // Turn on current LED (keeping previous ones on)
+    debugPrint("Testing LED " + String(LED_PINS[i]));
     setLedBrightness(i, 1.0);
-    delay(testSpeed);
-  }
-  
-  // ======== BUILDING DOWN PATTERN ========
-  Serial.println("Building DOWN: 25+26+27→25+26→25→off");
-  
-  // Building down (progressively remove LEDs)
-  for (int i = NUM_LEDS - 1; i >= 0; i--) {
-    Serial.print("Removing LED GPIO ");
-    Serial.println(LED_PINS[i]);
-    
-    // Turn off current LED (keeping others on)
+    delay(300);
     setLedBrightness(i, 0.0);
-    delay(testSpeed);
+    delay(100);
   }
   
-  // Short pause after the pattern
-  delay(300);
+  // Flash all LEDs together
+  for (int i = 0; i < 2; i++) {
+    // All on
+    for (int j = 0; j < NUM_LEDS; j++) {
+      setLedBrightness(j, 1.0);
+    }
+    delay(200);
+    
+    // All off
+    for (int j = 0; j < NUM_LEDS; j++) {
+      setLedBrightness(j, 0.0);
+    }
+    delay(200);
+  }
   
-  // Random blinking
-  Serial.println("Random blinking...");
-  randomLedBlink(8, testSpeed / 4);
+  debugPrint("=== LED TEST COMPLETE ===");
+}
+
+// Function to initialize WiFi and ESP-NOW
+void setupWiFiAndESPNOW() {
+  // Initialize WiFi with specific settings for better compatibility
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(10); // Ultra short delay
   
-  Serial.println("=== TEST COMPLETE ===");
-  delay(300);
+  WiFi.mode(WIFI_STA);
+  
+  // Disable Auto-Connect - important for reliability with ESP-NOW
+  WiFi.setAutoConnect(false);
+  WiFi.setAutoReconnect(false);
+  delay(10); // Ultra short delay
+  
+  // Broadcast MAC for better discovery - uncomment if needed
+  // uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  // esp_wifi_set_mac(WIFI_IF_STA, broadcastMac);
+  
+  // Set WiFi channel explicitly (must match sender's channel)
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  
+  // Set WiFi to maximum power for better reception
+  esp_wifi_set_max_tx_power(84); // Maximum power
+  
+  debugPrint("MAC Address: " + WiFi.macAddress());
+  
+  // Disable power saving for more reliable reception
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  
+  // Initialize ESP-NOW with faster retries
+  for (int retry = 0; retry < 2; retry++) {
+    esp_now_deinit(); // Clean start
+    delay(10); // Ultra short delay
+    if (esp_now_init() == ESP_OK) {
+      debugPrint("ESP-NOW initialized successfully");
+      return;
+    }
+  }
+  
+  debugPrint("ESP-NOW initialization failed after retries");
+}
+
+// ESP-NOW callback function
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  
+  debugPrint("ESP-NOW message received from: " + String(macStr));
+  debugPrint("Data length: " + String(len) + " bytes");
+  
+  messageReceived = true;
+  
+  if (len == sizeof(ESPNOWData)) {
+    // Process the received message
+    ESPNOWData receivedData;
+    memcpy(&receivedData, incomingData, sizeof(ESPNOWData));
+    
+    int targetLed = -1;
+    
+    // Determine which LED to activate
+    if (receivedData.useString) {
+      String message = String(receivedData.message);
+      message.toLowerCase();
+      
+      // Match color string to LED index
+      if (message == "green") {
+        targetLed = 0; // LED on pin 25
+      } else if (message == "yellow") {
+        targetLed = 1; // LED on pin 26
+      } else if (message == "red") {
+        targetLed = 2; // LED on pin 27
+      }
+      
+      debugPrint("Received string command: " + message);
+    } else {
+      // Using numerical value (0, 1, or 2)
+      if (receivedData.ledNumber >= 0 && receivedData.ledNumber < NUM_LEDS) {
+        targetLed = receivedData.ledNumber;
+      }
+      
+      debugPrint("Received numeric command: " + String(receivedData.ledNumber));
+    }
+    
+    // Activate the appropriate LED
+    if (targetLed >= 0 && targetLed < NUM_LEDS) {
+      setActiveLed(targetLed);
+    }
+  } else {
+    debugPrint("Warning: Incorrect data size received");
+  }
+  
+    //  debugPrint("Going to SLEEP now");
+    //  prepareForSleep();
+    // After waking from light sleep, code continues here
+  // Extend the listening period after receiving a message
+  listenStartTime = millis();
+}
+
+// Prepare for light sleep while keeping LEDs on
+void prepareForSleep() {
+  debugPrint("Light sleep for " + String(SLEEP_DURATION / 1000) + "s");
+  
+  // No need to modify GPIO settings for light sleep
+  // LEDs will stay in their current state during light sleep
+  
+  // Configure when to wake up
+  esp_sleep_enable_timer_wakeup(SLEEP_DURATION * 1000); // Convert to microseconds
+  
+  // Disable ESP-NOW and WiFi to save power (but fast to reinitialize)
+  esp_now_deinit();
+  WiFi.disconnect(false); // Don't disable RF
+  
+  Serial.flush(); // Make sure all Serial data is sent before sleeping
+  delay(10); // Brief delay to allow final operations to complete
+  
+  // Start light sleep
+  esp_light_sleep_start();
+  
+  // Code continues here after waking up from light sleep
+  debugPrint("Woke up!");
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Initialize serial first
+  if (SERIAL_ENABLED) {
+    Serial.begin(115200);
+    delay(100); // Shorter delay
+    Serial.println("\n\n"); // Clear any garbage
+  }
   
-  Serial.println("\n\nESP32 Lily T7 v1.5 - ESP-NOW LED Controller (Receiver) - Simple Version");
-  Serial.println("--------------------------------------------------------------");
+  // Increment boot count
+  bootCount++;
   
   // Configure PWM for all LEDs
   for (int i = 0; i < NUM_LEDS; i++) {
     ledcSetup(PWM_CHANNELS[i], PWM_FREQUENCY, PWM_RESOLUTION);
     ledcAttachPin(LED_PINS[i], PWM_CHANNELS[i]);
-    setLedBrightness(i, 0); // Start with all LEDs off
+    
+    // Initially turn all LEDs off
+    setLedBrightness(i, 0.0);
   }
   
-  // Initialize WiFi for ESP-NOW
-  WiFi.mode(WIFI_STA);
-  
-  Serial.println("========================================");
-  Serial.print("RECEIVER MAC Address: ");
-  Serial.println(WiFi.macAddress());
-  Serial.println("👆 COPY THIS MAC ADDRESS into your sender code! 👆");
-  Serial.println("Format in code: ");
-  
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  char macStr[150];
-  snprintf(macStr, sizeof(macStr), "uint8_t receiverMacAddress[] = {0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X};",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  Serial.println(macStr);
-  Serial.println("========================================");
-  
-  // Initialize ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
+  // First boot only
+  if (bootCount == 1) {
+    debugPrint("ESP32 ESP-NOW LED Receiver - Ultra-Fast Mode");
+    debugPrint("------------------------------------------");
+    
+    // Set all LEDs to ON briefly to show we're alive
+    for (int i = 0; i < NUM_LEDS; i++) {
+      setLedBrightness(i, 1.0);
+    }
+    delay(300);
+    for (int i = 0; i < NUM_LEDS; i++) {
+      setLedBrightness(i, 0.0);
+    }
+    delay(100);
+    
+    debugPrint("WiFi Channel: " + String(WIFI_CHANNEL));
+    debugPrint("Extended initial wake time: " + String(INITIAL_LISTEN / 1000) + "s");
+    debugPrint("Will stay awake for " + String(INITIAL_NO_SLEEP_CYCLES) + " cycles after boot");
+  } else {
+    debugPrint("Wakeup #" + String(bootCount));
   }
-  Serial.println("ESP-NOW initialized successfully");
   
-  // Register callback function for received data
+  // Restore active LED state
+  if (currentLedIndex >= 0 && currentLedIndex < NUM_LEDS) {
+    debugPrint("Active LED: " + String(currentLedIndex));
+    setActiveLed(currentLedIndex); // Full brightness
+  }
+  
+  // Initialize WiFi and ESP-NOW
+  setupWiFiAndESPNOW();
+  
+  // Register callback for when data is received
   esp_now_register_recv_cb(OnDataRecv);
-  Serial.println("Ready to receive ESP-NOW messages");
   
-  // Initialize the random number generator
-  randomSeed(millis());
+  // Set CPU to higher frequency for faster response on first boot
+  if (bootCount == 1) {
+    setCpuFrequencyMhz(240); // Full speed during initial connection
+  } else {
+    setCpuFrequencyMhz(80);  // Lower speed for power saving
+  }
   
-  // Run initial LED test with running up and down pattern
-  runLedTest();
+  // Start the listen period
+  listenStartTime = millis();
+  messageReceived = false;
   
-  // Very minimal power saving - just lower WiFi power slightly
-  // This is safer and won't interfere with ESP-NOW
-  esp_wifi_set_max_tx_power(40);  // Moderate power level (about 12dBm)
+  // On first boot, listen longer to ensure pairing
+  unsigned long currentListenTime = (bootCount == 1) ? INITIAL_LISTEN : LISTEN_DURATION;
   
-  Serial.println("Waiting for ESP-NOW commands...");
-  Serial.println("LEDs will continuously fade in/out until new command is received");
-
-  lastUpdateTime = millis();
+  debugPrint("Listening for " + String(currentListenTime / 1000) + "s");
 }
 
 void loop() {
-  // Non-blocking LED update
   unsigned long currentTime = millis();
+  unsigned long currentListenDuration = (bootCount == 1) ? INITIAL_LISTEN : LISTEN_DURATION;
   
-  // Only update at the specified interval for efficiency
-  if (currentTime - lastUpdateTime >= UPDATE_INTERVAL) {
-    // Update all LEDs
-    for (int i = 0; i < NUM_LEDS; i++) {
-      updateLedState(i, currentTime);
-    }
-    lastUpdateTime = currentTime;
-  }
-  
-  // Print heartbeat every 10 seconds to show the device is still running
+  // Print a periodic heartbeat for debugging - less frequent
   static unsigned long lastHeartbeat = 0;
-  if (currentTime - lastHeartbeat >= 10000) {
-    Serial.println("Heartbeat - waiting for ESP-NOW commands...");
+  if (currentTime - lastHeartbeat > 4000) { // 4-second heartbeat
+    debugPrint("Listening... (" + String((currentTime - listenStartTime) / 1000) + "s)");
     lastHeartbeat = currentTime;
   }
   
-  // Add a small delay to allow the ESP32 to yield to background tasks
-  delay(1);
+  // Check if listen period is over
+  if (currentTime - listenStartTime >= currentListenDuration) {
+    if (messageReceived) {
+      debugPrint("Message received this cycle");
+    } else {
+      debugPrint("No messages received");
+    }
+    
+    // Skip sleep on first boot or during no-sleep cycles
+    if (bootCount == 1 || noSleepCyclesLeft > 0) {
+      if (bootCount == 1) {
+        debugPrint("First boot - continuing without sleep");
+      } else {
+        debugPrint("Skipping sleep - remaining cycles: " + String(noSleepCyclesLeft));
+        noSleepCyclesLeft--;
+      }
+      
+      // Reset for next listening period without sleeping
+      listenStartTime = millis();
+      messageReceived = false;
+      
+      // Reinitialize ESP-NOW just to be safe
+      esp_now_unregister_recv_cb();
+      setupWiFiAndESPNOW();
+      esp_now_register_recv_cb(OnDataRecv);
+      
+      return; // Skip sleep
+    }
+    
+    debugPrint("Going to SLEEP now");
+    prepareForSleep();
+    // After waking from light sleep, code continues here
+    
+    // Reset for next listening period
+    listenStartTime = millis();
+    messageReceived = false;
+    
+    // Re-initialize WiFi and ESP-NOW after waking up
+    setupWiFiAndESPNOW();
+    esp_now_register_recv_cb(OnDataRecv);
+  }
+  
+  // Small delay to prevent busy waiting
+  delay(1); // Minimal delay for maximum responsiveness
 }
