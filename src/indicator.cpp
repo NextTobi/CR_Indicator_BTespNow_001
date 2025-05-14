@@ -1,6 +1,6 @@
 /**
  * ESP32 ESP-NOW LED Indicator System - INDICATOR (RECEIVER) CODE
- * Version: 7.1 - Reliable Light Sleep Implementation
+ * Version: 7.2 - Reliable Light Sleep Implementation with Non-Blocking Design
  * 
  * This implementation uses light sleep for maximum power efficiency
  * while maintaining reliable ESP-NOW communication.
@@ -45,76 +45,210 @@ typedef struct {
   uint8_t value;    // LED index or acknowledgment value
 } message_t;
 
+// State machine states
+enum SetupState {
+  SETUP_INIT,
+  SETUP_SERIAL_WAIT,
+  SETUP_LED_TEST,
+  SETUP_WIFI_INIT,
+  SETUP_WIFI_DISCONNECT_WAIT,
+  SETUP_WIFI_CHANNEL_WAIT,
+  SETUP_ESPNOW_INIT,
+  SETUP_COMPLETE
+};
+
+enum LedTestState {
+  LED_TEST_INIT,
+  LED_TEST_SEQUENCE,
+  LED_TEST_ALL_ON,
+  LED_TEST_ALL_OFF,
+  LED_TEST_COMPLETE
+};
+
+enum AckState {
+  ACK_INIT,
+  ACK_PEER_SETUP,
+  ACK_SEND,
+  ACK_WAIT,
+  ACK_COMPLETE
+};
+
+enum DiscoveryState {
+  DISCOVERY_INIT,
+  DISCOVERY_PEER_SETUP,
+  DISCOVERY_SEND,
+  DISCOVERY_COMPLETE
+};
+
+enum SleepState {
+  SLEEP_AWAKE,
+  SLEEP_PREPARE,
+  SLEEP_ENTER,
+  SLEEP_WAKEUP,
+  SLEEP_REINIT_START,
+  SLEEP_WIFI_DISCONNECT,
+  SLEEP_WIFI_SETUP,
+  SLEEP_WIFI_WAIT,
+  SLEEP_CHANNEL_SETUP,
+  SLEEP_CHANNEL_WAIT,
+  SLEEP_ESPNOW_INIT,
+  SLEEP_ESPNOW_CALLBACK,
+  SLEEP_PEER_SETUP,
+  SLEEP_COMPLETE
+};
+
 // Global variables
 Preferences preferences;
 int activeLedIndex = -1;
 uint8_t lastSenderMac[6] = {0};
 bool sendDiscoveryResponse = false;
 
+// State machine variables
+SetupState setupState = SETUP_INIT;
+LedTestState ledTestState = LED_TEST_INIT;
+AckState ackState = ACK_INIT;
+DiscoveryState discoveryState = DISCOVERY_INIT;
+SleepState sleepState = SLEEP_AWAKE;
+
+unsigned long stateTimer = 0;
+int currentTestLed = 0;
+int ackAttemptCount = 0;
+const uint8_t *ackTargetAddr = NULL;
+bool reinitRequired = false;
+
 // Function prototypes
-void runLedTest();
-void setupEspNow();
-void reinitEspNowAfterSleep();
+void processLedTest();
+bool setupEspNow();
+bool reinitEspNowAfterSleep();
 bool loadSavedAddresses();
 void savePeerAddress(const uint8_t *addr);
 void printMacAddress(const uint8_t *addr);
 void onDataReceived(const uint8_t *macAddr, const uint8_t *data, int dataLen);
 void handleLedCommand(uint8_t ledIndex, const uint8_t *senderAddr);
-void sendAcknowledgment(const uint8_t *addr);
-void handleDiscoveryResponse();
-void prepareForSleep();
-void handleWakeup();
+void processAcknowledgment();
+void processDiscoveryResponse();
+void processSleepWakeup();
 void printStatusUpdate();
 
 void setup() {
   Serial.begin(115200);
-  delay(500); // Short delay for serial to initialize
   
   // Set CPU frequency to 80MHz for power efficiency
   setCpuFrequencyMhz(80);
   
-  Serial.print("\n\n==== ESP32 ESP-NOW LED System ====\n");
-  Serial.println("INDICATOR MODE (RECEIVER)");
-  Serial.println("FW Version: 7.1 - Reliable Light Sleep Implementation");
-  
-  // Initialize LED pins
-  for (int i = 0; i < NUM_LEDS; i++) {
-    pinMode(LED_PINS[i], OUTPUT);
-    digitalWrite(LED_PINS[i], HIGH);  // LEDs are OFF initially (active LOW)
-  }
-  
-  // Run LED test
-  runLedTest();
+  // Initialize setup state machine
+  setupState = SETUP_SERIAL_WAIT;
+  stateTimer = millis();
   
   // Initialize preferences
   preferences.begin(PREF_NAMESPACE, false);
-  
-  // Load saved addresses
-  if (loadSavedAddresses()) {
-    Serial.println("Loaded saved peer address:");
-    printMacAddress(lastSenderMac);
-  } else {
-    Serial.println("No saved peer address found.");
-  }
-  
-  // Setup ESP-NOW
-  setupEspNow();
-  
-  Serial.println("Indicator ready - using optimized light sleep");
-  Serial.printf("Sleep pattern: %dms awake, %dms sleep\n", 
-                AWAKE_TIME_MS, SLEEP_DURATION_MS);
-  
-  lastStatusTime = millis();
-  lastCommandTime = millis(); // Start with active state
-  nextSleepTime = millis() + AWAKE_AFTER_COMMAND_MS; // Set initial sleep time
 }
 
 void loop() {
   unsigned long currentTime = millis();
   
-  // Handle any pending discovery responses
-  if (sendDiscoveryResponse) {
-    handleDiscoveryResponse();
+  // Handle setup state machine
+  if (setupState != SETUP_COMPLETE) {
+    switch (setupState) {
+      case SETUP_SERIAL_WAIT:
+        if (currentTime - stateTimer >= 500) {
+          Serial.print("\n\n==== ESP32 ESP-NOW LED System ====\n");
+          Serial.println("INDICATOR MODE (RECEIVER)");
+          Serial.println("FW Version: 7.2 - Reliable Light Sleep Implementation with Non-Blocking Design");
+          
+          // Initialize LED pins
+          for (int i = 0; i < NUM_LEDS; i++) {
+            pinMode(LED_PINS[i], OUTPUT);
+            digitalWrite(LED_PINS[i], HIGH);  // LEDs are OFF initially (active LOW)
+          }
+          
+          ledTestState = LED_TEST_INIT;
+          setupState = SETUP_LED_TEST;
+        }
+        break;
+        
+      case SETUP_LED_TEST:
+        processLedTest();
+        if (ledTestState == LED_TEST_COMPLETE) {
+          // Load saved addresses
+          if (loadSavedAddresses()) {
+            Serial.println("Loaded saved peer address:");
+            printMacAddress(lastSenderMac);
+          } else {
+            Serial.println("No saved peer address found.");
+          }
+          
+          setupState = SETUP_WIFI_INIT;
+        }
+        break;
+        
+      case SETUP_WIFI_INIT:
+        // Initialize WiFi in Station mode
+        WiFi.mode(WIFI_STA);
+        WiFi.disconnect();
+        stateTimer = currentTime;
+        setupState = SETUP_WIFI_DISCONNECT_WAIT;
+        break;
+        
+      case SETUP_WIFI_DISCONNECT_WAIT:
+        if (currentTime - stateTimer >= 300) {
+          // Set WiFi channel
+          esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+          stateTimer = currentTime;
+          setupState = SETUP_WIFI_CHANNEL_WAIT;
+        }
+        break;
+        
+      case SETUP_WIFI_CHANNEL_WAIT:
+        if (currentTime - stateTimer >= 100) {
+          setupState = SETUP_ESPNOW_INIT;
+        }
+        break;
+        
+      case SETUP_ESPNOW_INIT:
+        // Initialize ESP-NOW
+        esp_err_t result = esp_now_init();
+        if (result != ESP_OK) {
+          Serial.printf("Error initializing ESP-NOW: %d\n", result);
+          stateTimer = currentTime;
+          ESP.restart(); // Restart ESP32 if initialization fails
+          return;
+        }
+        
+        // Register receive callback
+        esp_now_register_recv_cb(onDataReceived);
+        
+        Serial.printf("Device MAC Address: %s\n", WiFi.macAddress().c_str());
+        Serial.printf("Operating on WiFi channel: %d\n", WIFI_CHANNEL);
+        
+        Serial.println("Indicator ready - using optimized light sleep");
+        Serial.printf("Sleep pattern: %dms awake, %dms sleep\n", 
+                      AWAKE_TIME_MS, SLEEP_DURATION_MS);
+        
+        lastStatusTime = currentTime;
+        lastCommandTime = currentTime; // Start with active state
+        nextSleepTime = currentTime + AWAKE_AFTER_COMMAND_MS; // Set initial sleep time
+        
+        setupState = SETUP_COMPLETE;
+        break;
+    }
+    
+    return; // Don't process the rest of the loop until setup is complete
+  }
+  
+  // Process acknowledgment if needed
+  if (ackState != ACK_INIT && ackState != ACK_COMPLETE) {
+    processAcknowledgment();
+  }
+  
+  // Process discovery response if needed
+  if (sendDiscoveryResponse && discoveryState == DISCOVERY_INIT) {
+    discoveryState = DISCOVERY_PEER_SETUP;
+    stateTimer = currentTime;
+  }
+  
+  if (discoveryState != DISCOVERY_INIT && discoveryState != DISCOVERY_COMPLETE) {
+    processDiscoveryResponse();
   }
   
   // Print status update periodically
@@ -129,7 +263,7 @@ void loop() {
   }
   
   // Determine if we should stay awake or enter sleep
-  bool shouldSleep = false;
+  bool shouldPrepareSleep = false;
   
   // After receiving a command, stay awake for defined period
   if (currentTime - lastCommandTime < AWAKE_AFTER_COMMAND_MS) {
@@ -139,6 +273,7 @@ void loop() {
     }
     nextSleepTime = lastCommandTime + AWAKE_AFTER_COMMAND_MS;
     consecutiveSleepCycles = 0;
+    sleepState = SLEEP_AWAKE;
     
   } else if (forceExtendedAwake) {
     // We're in a forced extended awake period
@@ -154,181 +289,213 @@ void loop() {
         nextSleepTime = currentTime + 100; // Enter sleep soon
       }
     }
+    sleepState = SLEEP_AWAKE;
     
-  } else if (currentTime >= nextSleepTime) {
+  } else if (currentTime >= nextSleepTime && sleepState == SLEEP_AWAKE) {
     // Time to enter a sleep cycle
-    shouldSleep = true;
+    shouldPrepareSleep = true;
   }
   
-  // Enter sleep if conditions are met
-  if (shouldSleep) {
-    // Scan briefly before sleep
+  // Process sleep/wakeup state machine
+  if (shouldPrepareSleep) {
+    sleepState = SLEEP_PREPARE;
+    stateTimer = currentTime;
     Serial.println("Scanning briefly before sleep");
-    delay(AWAKE_TIME_MS); // Brief scanning period
-    
-    // Enter sleep
-    prepareForSleep();
-    esp_light_sleep_start();
-    
-    // After wakeup
-    handleWakeup();
-    
-    // Update sleep cycle tracking
-    consecutiveSleepCycles++;
-    
-    // Check if we need to force an extended awake period
-    if (consecutiveSleepCycles >= MAX_SLEEP_CYCLES) {
-      Serial.println("Forcing extended awake period after multiple sleep cycles");
-      forceExtendedAwake = true;
-      consecutiveSleepCycles = 0;
-    } else {
-      // Schedule next sleep
-      nextSleepTime = millis() + AWAKE_TIME_MS;
-    }
-  } else {
-    // In active scanning mode, just a short delay
-    delay(10);
+  }
+  
+  // Process sleep state machine if not in AWAKE state
+  if (sleepState != SLEEP_AWAKE) {
+    processSleepWakeup();
   }
 }
 
-void prepareForSleep() {
-  Serial.printf("Entering light sleep for %d ms\n", SLEEP_DURATION_MS);
-  Serial.flush(); // Ensure all data is sent before sleep
+void processLedTest() {
+  static unsigned long ledTimer = 0;
+  unsigned long currentTime = millis();
   
-  // Configure light sleep
-  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MS * 1000); // Convert to microseconds
-  
-  // Hold GPIO state for LED
-  if (activeLedIndex >= 0) {
-    gpio_hold_en((gpio_num_t)LED_PINS[activeLedIndex]);
-    gpio_deep_sleep_hold_en(); // Enable GPIO hold during sleep
+  switch (ledTestState) {
+    case LED_TEST_INIT:
+      Serial.println("Running LED test sequence");
+      currentTestLed = 0;
+      ledTimer = currentTime;
+      ledTestState = LED_TEST_SEQUENCE;
+      break;
+      
+    case LED_TEST_SEQUENCE:
+      if (currentTime - ledTimer < 300) {
+        // LED on for 300ms
+        digitalWrite(LED_PINS[currentTestLed], LOW);
+      } else if (currentTime - ledTimer < 400) {
+        // LED off for 100ms
+        digitalWrite(LED_PINS[currentTestLed], HIGH);
+      } else {
+        // Move to next LED
+        currentTestLed++;
+        if (currentTestLed >= NUM_LEDS) {
+          ledTestState = LED_TEST_ALL_ON;
+        } else {
+          ledTimer = currentTime;
+        }
+      }
+      break;
+      
+    case LED_TEST_ALL_ON:
+      // Turn all LEDs on
+      for (int i = 0; i < NUM_LEDS; i++) {
+        digitalWrite(LED_PINS[i], LOW);
+      }
+      ledTimer = currentTime;
+      ledTestState = LED_TEST_ALL_OFF;
+      break;
+      
+    case LED_TEST_ALL_OFF:
+      if (currentTime - ledTimer >= 300) {
+        // Turn all LEDs off after 300ms
+        for (int i = 0; i < NUM_LEDS; i++) {
+          digitalWrite(LED_PINS[i], HIGH);
+        }
+        ledTestState = LED_TEST_COMPLETE;
+        Serial.println("LED test complete");
+      }
+      break;
+      
+    case LED_TEST_COMPLETE:
+      // Nothing to do, test is complete
+      break;
   }
 }
 
-void handleWakeup() {
-  Serial.println("Woke up from light sleep");
-  
-  // Disable GPIO hold
-  gpio_hold_dis((gpio_num_t)LED_PINS[0]);
-  gpio_hold_dis((gpio_num_t)LED_PINS[1]);
-  gpio_hold_dis((gpio_num_t)LED_PINS[2]);
-  gpio_deep_sleep_hold_dis();
-  
-  // Ensure LED state is maintained after wakeup
-  if (activeLedIndex >= 0) {
-    digitalWrite(LED_PINS[activeLedIndex], LOW);
-  }
-  
-  // Reinitialize ESP-NOW after sleep
-  reinitEspNowAfterSleep();
+bool setupEspNow() {
+  // This function is now handled by the setup state machine
+  return true;
 }
 
-void printStatusUpdate() {
-  Serial.println("\n--- STATUS UPDATE ---");
-  if (activeLedIndex >= 0) {
-    Serial.printf("Current active LED: %d (pin: %d)\n", 
-                  activeLedIndex, LED_PINS[activeLedIndex]);
-  } else {
-    Serial.println("No active LED");
-  }
+void processSleepWakeup() {
+  unsigned long currentTime = millis();
   
-  Serial.printf("Time since last command: %.2f seconds\n", 
-                (millis() - lastCommandTime) / 1000.0);
-  Serial.printf("Consecutive sleep cycles: %d\n", consecutiveSleepCycles);
-  Serial.printf("Current mode: %s\n", 
-                forceExtendedAwake ? "Extended awake" : 
-                ((millis() - lastCommandTime < AWAKE_AFTER_COMMAND_MS) ? 
-                 "Post-command scanning" : "Normal sleep cycle"));
-  Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
-  Serial.printf("WiFi channel: %d\n", WIFI_CHANNEL);
-  Serial.println("---------------------");
+  switch (sleepState) {
+    case SLEEP_PREPARE:
+      if (currentTime - stateTimer >= AWAKE_TIME_MS) {
+        // After brief scanning period, enter sleep
+        Serial.printf("Entering light sleep for %d ms\n", SLEEP_DURATION_MS);
+        Serial.flush(); // Ensure all data is sent before sleep
+        
+        // Configure light sleep
+        esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MS * 1000); // Convert to microseconds
+        
+        // Hold GPIO state for LED
+        if (activeLedIndex >= 0) {
+          gpio_hold_en((gpio_num_t)LED_PINS[activeLedIndex]);
+          gpio_deep_sleep_hold_en(); // Enable GPIO hold during sleep
+        }
+        
+        sleepState = SLEEP_ENTER;
+      }
+      break;
+      
+    case SLEEP_ENTER:
+      esp_light_sleep_start();
+      // Code continues here after wakeup
+      Serial.println("Woke up from light sleep");
+      
+      // Disable GPIO hold
+      gpio_hold_dis((gpio_num_t)LED_PINS[0]);
+      gpio_hold_dis((gpio_num_t)LED_PINS[1]);
+      gpio_hold_dis((gpio_num_t)LED_PINS[2]);
+      gpio_deep_sleep_hold_dis();
+      
+      // Ensure LED state is maintained after wakeup
+      if (activeLedIndex >= 0) {
+        digitalWrite(LED_PINS[activeLedIndex], LOW);
+      }
+      
+      sleepState = SLEEP_REINIT_START;
+      stateTimer = millis();
+      break;
+      
+    case SLEEP_REINIT_START:
+      // De-initialize ESP-NOW
+      esp_now_deinit();
+      sleepState = SLEEP_WIFI_DISCONNECT;
+      stateTimer = millis();
+      break;
+      
+    case SLEEP_WIFI_DISCONNECT:
+      if (millis() - stateTimer >= 20) {
+        // Reinitialize WiFi
+        WiFi.disconnect();
+        WiFi.mode(WIFI_STA);
+        sleepState = SLEEP_WIFI_SETUP;
+        stateTimer = millis();
+      }
+      break;
+      
+    case SLEEP_WIFI_SETUP:
+      if (millis() - stateTimer >= 20) {
+        // Set WiFi channel
+        esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        sleepState = SLEEP_CHANNEL_SETUP;
+        stateTimer = millis();
+      }
+      break;
+      
+    case SLEEP_CHANNEL_SETUP:
+      if (millis() - stateTimer >= 20) {
+        // Initialize ESP-NOW
+        esp_err_t result = esp_now_init();
+        if (result != ESP_OK) {
+          Serial.printf("Error reinitializing ESP-NOW: %d\n", result);
+          sleepState = SLEEP_COMPLETE; // Skip to complete even on error
+        } else {
+          sleepState = SLEEP_ESPNOW_CALLBACK;
+        }
+        stateTimer = millis();
+      }
+      break;
+      
+    case SLEEP_ESPNOW_CALLBACK:
+      // Register receive callback
+      esp_now_register_recv_cb(onDataReceived);
+      sleepState = SLEEP_PEER_SETUP;
+      stateTimer = millis();
+      break;
+      
+    case SLEEP_PEER_SETUP:
+      // Re-add peer if we have one
+      if (lastSenderMac[0] != 0 || lastSenderMac[1] != 0) {
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, lastSenderMac, 6);
+        peerInfo.channel = WIFI_CHANNEL;
+        peerInfo.encrypt = false;
+        esp_now_add_peer(&peerInfo);
+      }
+      
+      Serial.println("ESP-NOW reinitialized after sleep");
+      sleepState = SLEEP_COMPLETE;
+      break;
+      
+    case SLEEP_COMPLETE:
+      // Update sleep cycle tracking
+      consecutiveSleepCycles++;
+      
+      // Check if we need to force an extended awake period
+      if (consecutiveSleepCycles >= MAX_SLEEP_CYCLES) {
+        Serial.println("Forcing extended awake period after multiple sleep cycles");
+        forceExtendedAwake = true;
+        consecutiveSleepCycles = 0;
+      } else {
+        // Schedule next sleep
+        nextSleepTime = millis() + AWAKE_TIME_MS;
+      }
+      
+      sleepState = SLEEP_AWAKE;
+      break;
+  }
 }
 
-void runLedTest() {
-  Serial.println("Running LED test sequence");
-  
-  // Turn on each LED in sequence
-  for (int i = 0; i < NUM_LEDS; i++) {
-    digitalWrite(LED_PINS[i], LOW);   // Turn ON (active LOW)
-    delay(300);
-    digitalWrite(LED_PINS[i], HIGH);  // Turn OFF
-    delay(100);
-  }
-  
-  // Flash all LEDs once to confirm end of test
-  for (int i = 0; i < NUM_LEDS; i++) {
-    digitalWrite(LED_PINS[i], LOW);   // All ON
-  }
-  delay(300);
-  for (int i = 0; i < NUM_LEDS; i++) {
-    digitalWrite(LED_PINS[i], HIGH);  // All OFF
-  }
-  
-  Serial.println("LED test complete");
-}
-
-void setupEspNow() {
-  // Initialize WiFi in Station mode
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(300);
-  
-  // Set WiFi channel
-  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  delay(100);
-  
-  // Initialize ESP-NOW
-  esp_err_t result = esp_now_init();
-  if (result != ESP_OK) {
-    Serial.printf("Error initializing ESP-NOW: %d\n", result);
-    delay(3000);
-    ESP.restart();
-    return;
-  }
-  
-  // Register receive callback
-  esp_now_register_recv_cb(onDataReceived);
-  
-  Serial.printf("Device MAC Address: %s\n", WiFi.macAddress().c_str());
-  Serial.printf("Operating on WiFi channel: %d\n", WIFI_CHANNEL);
-}
-
-void reinitEspNowAfterSleep() {
-  // De-initialize ESP-NOW
-  esp_now_deinit();
-  
-  // Wait a bit to ensure clean state
-  delay(20);
-  
-  // Reinitialize WiFi
-  WiFi.disconnect();
-  WiFi.mode(WIFI_STA);
-  delay(20);
-  
-  // Set WiFi channel
-  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  delay(20);
-  
-  // Initialize ESP-NOW
-  esp_err_t result = esp_now_init();
-  if (result != ESP_OK) {
-    Serial.printf("Error reinitializing ESP-NOW: %d\n", result);
-    return;
-  }
-  
-  // Register receive callback
-  esp_now_register_recv_cb(onDataReceived);
-  
-  // Re-add peer if we have one
-  if (lastSenderMac[0] != 0 || lastSenderMac[1] != 0) {
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, lastSenderMac, 6);
-    peerInfo.channel = WIFI_CHANNEL;
-    peerInfo.encrypt = false;
-    esp_now_add_peer(&peerInfo);
-  }
-  
-  Serial.println("ESP-NOW reinitialized after sleep");
+bool reinitEspNowAfterSleep() {
+  // This is now handled by the sleep state machine
+  return true;
 }
 
 bool loadSavedAddresses() {
@@ -416,87 +583,177 @@ void handleLedCommand(uint8_t ledIndex, const uint8_t *senderAddr) {
   
   Serial.printf("Activated LED on pin: %d\n", LED_PINS[ledIndex]);
   
-  // Send acknowledgment back to sender
-  sendAcknowledgment(senderAddr);
+  // Start acknowledgment process
+  ackTargetAddr = senderAddr;
+  ackState = ACK_INIT;
+  ackAttemptCount = 0;
+  processAcknowledgment(); // Begin processing immediately
 }
 
-void handleDiscoveryResponse() {
-  message_t message;
-  message.type = DISCOVERY;
-  message.value = 0;
+void processAcknowledgment() {
+  static unsigned long ackTimer = 0;
+  unsigned long currentTime = millis();
   
-  // Create or update the peer
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, lastSenderMac, 6);
-  peerInfo.channel = WIFI_CHANNEL;
-  peerInfo.encrypt = false;
-  
-  // More reliable peer management - check before deleting
-  if (esp_now_is_peer_exist(lastSenderMac)) {
-    esp_now_del_peer(lastSenderMac);
+  switch (ackState) {
+    case ACK_INIT:
+      // Create peer info structure
+      ackTimer = currentTime;
+      ackState = ACK_PEER_SETUP;
+      // Fall through to next state
+      
+    case ACK_PEER_SETUP:
+      {
+        if (ackTargetAddr == NULL) {
+          ackState = ACK_COMPLETE;
+          break;
+        }
+        
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, ackTargetAddr, 6);
+        peerInfo.channel = WIFI_CHANNEL;
+        peerInfo.encrypt = false;
+        
+        // More reliable peer management - check before deleting
+        if (esp_now_is_peer_exist(ackTargetAddr)) {
+          esp_now_del_peer(ackTargetAddr);
+        }
+        
+        // Add peer
+        esp_err_t result = esp_now_add_peer(&peerInfo);
+        
+        if (result != ESP_OK && currentTime - ackTimer < 10) {
+          // Need to wait a bit before retrying
+          break;
+        } else if (result != ESP_OK) {
+          // Retry once more if failed
+          result = esp_now_add_peer(&peerInfo);
+        }
+        
+        if (result != ESP_OK) {
+          Serial.printf("Peer management error: %d\n", result);
+          ackState = ACK_COMPLETE;
+        } else {
+          ackState = ACK_SEND;
+          ackTimer = currentTime;
+        }
+      }
+      break;
+      
+    case ACK_SEND:
+      {
+        message_t message;
+        message.type = ACKNOWLEDGMENT;
+        message.value = activeLedIndex;
+        
+        esp_err_t result = esp_now_send(ackTargetAddr, (uint8_t *)&message, sizeof(message));
+        if (result == ESP_OK) {
+          Serial.printf("Acknowledgment %d sent successfully\n", ackAttemptCount + 1);
+        } else {
+          Serial.printf("Error on attempt %d: %d\n", ackAttemptCount + 1, result);
+        }
+        
+        ackAttemptCount++;
+        ackTimer = currentTime;
+        ackState = ACK_WAIT;
+      }
+      break;
+      
+    case ACK_WAIT:
+      if (currentTime - ackTimer >= 20) {
+        // Wait is complete, check if we need more attempts
+        if (ackAttemptCount < 3) {
+          ackState = ACK_SEND;
+        } else {
+          Serial.printf("Completed acknowledgments for LED index: %d\n", activeLedIndex);
+          ackState = ACK_COMPLETE;
+        }
+      }
+      break;
+      
+    case ACK_COMPLETE:
+      // Reset for next time
+      ackState = ACK_INIT;
+      ackTargetAddr = NULL;
+      break;
   }
+}
+
+void processDiscoveryResponse() {
+  static unsigned long discoveryTimer = 0;
+  unsigned long currentTime = millis();
   
-  // Add with error checking
-  esp_err_t result = esp_now_add_peer(&peerInfo);
-  if (result != ESP_OK) {
-    // Retry once more if failed
-    delay(10);
-    result = esp_now_add_peer(&peerInfo);
+  switch (discoveryState) {
+    case DISCOVERY_PEER_SETUP:
+      {
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, lastSenderMac, 6);
+        peerInfo.channel = WIFI_CHANNEL;
+        peerInfo.encrypt = false;
+        
+        // More reliable peer management - check before deleting
+        if (esp_now_is_peer_exist(lastSenderMac)) {
+          esp_now_del_peer(lastSenderMac);
+        }
+        
+        // Add with error checking
+        esp_err_t result = esp_now_add_peer(&peerInfo);
+        
+        if (result != ESP_OK && currentTime - stateTimer < 10) {
+          // Need to wait a bit before retrying
+          break;
+        } else if (result != ESP_OK) {
+          // Retry once more
+          result = esp_now_add_peer(&peerInfo);
+        }
+        
+        if (result != ESP_OK) {
+          Serial.printf("Peer management error: %d\n", result);
+          discoveryState = DISCOVERY_COMPLETE;
+        } else {
+          discoveryState = DISCOVERY_SEND;
+        }
+      }
+      break;
+      
+    case DISCOVERY_SEND:
+      {
+        message_t message;
+        message.type = DISCOVERY;
+        message.value = 0;
+        
+        esp_err_t result = esp_now_send(lastSenderMac, (uint8_t *)&message, sizeof(message));
+        Serial.printf("Discovery response status: %s\n", 
+                      (result == ESP_OK) ? "Success" : "Failed");
+        
+        sendDiscoveryResponse = false;
+        discoveryState = DISCOVERY_COMPLETE;
+      }
+      break;
+      
+    case DISCOVERY_COMPLETE:
+      // Reset for next time
+      discoveryState = DISCOVERY_INIT;
+      break;
   }
-  
-  if (result != ESP_OK) {
-    Serial.printf("Peer management error: %d\n", result);
+}
+
+void printStatusUpdate() {
+  Serial.println("\n--- STATUS UPDATE ---");
+  if (activeLedIndex >= 0) {
+    Serial.printf("Current active LED: %d (pin: %d)\n", 
+                  activeLedIndex, LED_PINS[activeLedIndex]);
   } else {
-    // Send discovery response
-    result = esp_now_send(lastSenderMac, (uint8_t *)&message, sizeof(message));
-    Serial.printf("Discovery response status: %s\n", 
-                  (result == ESP_OK) ? "Success" : "Failed");
+    Serial.println("No active LED");
   }
   
-  sendDiscoveryResponse = false;
-}
-
-void sendAcknowledgment(const uint8_t *addr) {
-  // Create peer info structure
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, addr, 6);
-  peerInfo.channel = WIFI_CHANNEL;
-  peerInfo.encrypt = false;
-  
-  // More reliable peer management - check before deleting
-  if (esp_now_is_peer_exist(addr)) {
-    esp_now_del_peer(addr);
-  }
-  
-  // Add with error checking
-  esp_err_t result = esp_now_add_peer(&peerInfo);
-  if (result != ESP_OK) {
-    // Retry once more if failed
-    delay(10);
-    result = esp_now_add_peer(&peerInfo);
-  }
-  
-  if (result != ESP_OK) {
-    Serial.printf("Peer management error: %d\n", result);
-    return;
-  }
-  
-  // Send multiple acknowledgments for redundancy
-  bool success = false;
-  for (int i = 0; i < 3; i++) {  // Reduced to 3 for efficiency
-    message_t message;
-    message.type = ACKNOWLEDGMENT;
-    message.value = activeLedIndex;
-    
-    result = esp_now_send(addr, (uint8_t *)&message, sizeof(message));
-    if (result == ESP_OK) {
-      Serial.printf("Acknowledgment %d sent successfully\n", i + 1);
-      success = true;
-    } else {
-      Serial.printf("Error on attempt %d: %d\n", i + 1, result);
-    }
-    delay(20);  // Reduced delay for faster acknowledgment
-  }
-  
-  Serial.printf("Completed acknowledgments for LED index: %d\n", activeLedIndex);
+  Serial.printf("Time since last command: %.2f seconds\n", 
+                (millis() - lastCommandTime) / 1000.0);
+  Serial.printf("Consecutive sleep cycles: %d\n", consecutiveSleepCycles);
+  Serial.printf("Current mode: %s\n", 
+                forceExtendedAwake ? "Extended awake" : 
+                ((millis() - lastCommandTime < AWAKE_AFTER_COMMAND_MS) ? 
+                 "Post-command scanning" : "Normal sleep cycle"));
+  Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
+  Serial.printf("WiFi channel: %d\n", WIFI_CHANNEL);
+  Serial.println("---------------------");
 }
